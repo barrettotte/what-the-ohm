@@ -1,4 +1,9 @@
 data/*
+!data/dataset.py
 resistors.zip
 
 .ipynb_checkpoints/
+logs/
+train.log
+
+*.pth

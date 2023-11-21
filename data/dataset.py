@@ -1,5 +1,6 @@
-# build CSV of resistor images and their respective values
-# also prepare zip file for kaggle dataset
+# Ran after collecting all images to build CSV of resistor images and their respective values.
+# Prepares zip file for kaggle dataset.
+# Note: This script isn't meant to be ran after building the Kaggle dataset.
 
 import csv
 import json
@@ -9,7 +10,7 @@ import traceback
 from pathlib import Path
 
 WATTS = 0.25
-DATA_ROOT = Path('./data')
+DATA_ROOT = Path('./')
 
 # parse resistor values from filenames
 def parse_filename(f: str) -> dict:
