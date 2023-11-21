@@ -10,7 +10,7 @@ import traceback
 from pathlib import Path
 
 WATTS = 0.25
-DATA_ROOT = Path('./')
+DATA_ROOT = Path('./data/')
 
 # parse resistor values from filenames
 def parse_filename(f: str) -> dict:

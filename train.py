@@ -1,5 +1,4 @@
 import logging
-import math
 import os
 import random
 import sys
@@ -41,7 +40,9 @@ class CONFIG:
     num_workers = 8
     batch_size = 8
     img_size = 256
-    epochs = 20
+    epochs = 15
+    loss_weight = 5
+    initial_lr = 0.0001
     train_log_interval = 5
 
 # dataset to load resistor images and one hot encode bands
@@ -75,6 +76,18 @@ class ResistorDataset(Dataset):
 
         return (torch.tensor(X, dtype=torch.float32), torch.tensor(y, dtype=torch.float32))
 
+class BCEWithLogitsLossWeighted(nn.Module):
+    def __init__(self, weight, *args, **kwargs):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss(*args, **kwargs, reduction='none')
+        self.weight = weight
+    
+    def forward(self, logits, labels):
+        loss = self.bce(logits, labels)
+        binary_labels = labels.bool()
+        loss[binary_labels] *= labels[binary_labels] * self.weight
+        return torch.mean(loss)
+
 # init environment
 def setup():
     # seed everything for reproducibility
@@ -98,14 +111,10 @@ def setup():
         ],
     )
 
-    # log basic env information
+    # log env/config information for sanity
     logging.debug(f'torch version: {torch.__version__}')
-    logging.debug(f'device: {CONFIG.device}')
     logging.debug(f'{torch.cuda.device_count()} GPU(s) available')
-    logging.debug(f'num_workers: {CONFIG.num_workers}')
-    logging.debug(f'batch_size: {CONFIG.batch_size}')
-    logging.debug(f'img_size: {CONFIG.img_size}')
-    logging.debug(f'epochs: {CONFIG.epochs}')
+    logging.debug(f'config: {CONFIG}')
 
 # load training data from csv
 def load_data(csv_path: str) -> pd.DataFrame:
@@ -113,7 +122,7 @@ def load_data(csv_path: str) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
     df['bands'] = df['bands'].apply(lambda x: x.split(' '))
 
-    # filter to only 4-band images TODO: remove?
+    # filter to only 4-band images
     df = df[df['image'].str.startswith('4-band')]
 
     logging.debug(f'Train shape: {df.shape}')
@@ -172,28 +181,8 @@ def get_dataloaders(df: pd.DataFrame, root_dir: Path) -> Tuple[DataLoader, DataL
 
 # build neural network
 def build_model(classes: List[str]) -> nn.Module:
-    # model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
-    # model.fc = nn.Sequential(
-    #     nn.Linear(in_features=model.fc.in_features, out_features=len(classes)),
-    #     nn.Sigmoid(), # clamp 0-1
-    # )
-    # logging.debug(f'Using ResNet-50')
-
-    # model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-    # model.fc = nn.Sequential(
-    #     nn.Linear(in_features=model.fc.in_features, out_features=len(classes)),
-    #     nn.Sigmoid(), # clamp 0-1
-    # )
-    # logging.debug(f'Using ResNet-18')
-
-    # model = models.efficientnet_v2_s(weights=models.EfficientNet_V2_S_Weights.DEFAULT)
-    # model.classifier[1] = nn.Linear(in_features=model.classifier[1].in_features, out_features=len(classes))
-    # # model.classifier.append(nn.Sigmoid())
-    # logging.debug(f'Using EfficientNet_v2_s')
-
     model = models.efficientnet_v2_m(weights=models.EfficientNet_V2_M_Weights.DEFAULT)
     model.classifier[1] = nn.Linear(in_features=model.classifier[1].in_features, out_features=len(classes))
-    # model.classifier.append(nn.Sigmoid())
     logging.debug(f'Using EfficientNet_v2_m')
 
     return model.to(CONFIG.device)
@@ -201,7 +190,7 @@ def build_model(classes: List[str]) -> nn.Module:
 # model training step
 def train_step(dataloader: DataLoader, model: nn.Module, criterion: nn.Module, optimizer: optim.Optimizer, 
                scheduler: optim.lr_scheduler.LRScheduler = None) -> List[float]:
-    mean_losses = []
+    losses = []
     model.train()
 
     for batch, (inputs, labels) in enumerate(dataloader):
@@ -209,22 +198,21 @@ def train_step(dataloader: DataLoader, model: nn.Module, criterion: nn.Module, o
         inputs, labels = inputs.to(CONFIG.device), labels.to(CONFIG.device)
         logits = model(inputs)
         loss = criterion(logits, labels)
-        mean_loss = loss.mean()
-        mean_losses.append(mean_loss.item())
+        losses.append(loss.item())
 
         # backward pass + optimize
         optimizer.zero_grad()
-        mean_loss.backward()
+        loss.backward()
         optimizer.step()
-
-        if scheduler:
-            scheduler.step()
 
         if batch % CONFIG.train_log_interval == 0:
             current_batch = (batch + 1) * len(inputs)
-            logging.info(f'Training: Mean loss = {mean_loss.item():>7f} [{current_batch:>5d}/{len(dataloader.dataset):>5d}]')
+            logging.info(f'Training: Loss = {loss.item():>7f} [{current_batch:>5d}/{len(dataloader.dataset):>5d}]')
+    
+    if scheduler:
+        scheduler.step()
 
-    return mean_losses
+    return losses
 
 # calculate model accuracy
 def calculate_accuracy(logits: torch.Tensor, labels: torch.Tensor, threshold: float = 0.5) -> float:
@@ -243,12 +231,12 @@ def valid_step(dataloader: DataLoader, model: nn.Module, criterion: nn.Module):
             logits = model(inputs)
 
             loss = criterion(logits, labels)
-            total_loss += loss.mean()
+            total_loss += loss
             total_accuracy += calculate_accuracy(logits, labels)
 
     avg_loss = total_loss / len(dataloader)
     avg_accuracy = total_accuracy / len(dataloader)
-    logging.info(f'Validation: Accuracy={(100 * avg_accuracy):>0.1f}%, Average_Loss={avg_loss:>8f}')
+    logging.info(f'Validation: Average Accuracy={(100 * avg_accuracy):>0.1f}%, Average Loss={avg_loss:>8f}')
 
 def main():
     setup()
@@ -260,15 +248,13 @@ def main():
     # build model
     classes = get_classes(all_data)
     model = build_model(classes)
-    criterion = nn.BCEWithLogitsLoss(reduction='none')
-    optimizer = optim.Adam(model.parameters(), lr=0.0001)
-    scheduler = None
-    # scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
-    
+    criterion = BCEWithLogitsLossWeighted(weight=CONFIG.loss_weight)
+    optimizer = optim.Adam(model.parameters(), lr=CONFIG.initial_lr)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
 
     # train model
-    start_time = time.time()
     logging.debug("Started training model")
+    start_time = time.time()
     losses = []
     for epoch in range(CONFIG.epochs):
         logging.info(f'Started epoch [{epoch+1}/{CONFIG.epochs}]')
